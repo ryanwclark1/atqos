@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"atqos/internal/agent"
 	"atqos/internal/config"
 	"atqos/internal/core"
+	"atqos/internal/engine"
 	"atqos/internal/eventlog"
+	"atqos/internal/git"
 	"atqos/internal/plugins/coverage"
 	"atqos/internal/plugins/pytest"
 	"atqos/internal/repo"
@@ -79,6 +83,16 @@ func (c Command) Run(ctx context.Context) (Result, error) {
 	if err := storeDB.CreateRun(ctx, run); err != nil {
 		return Result{}, err
 	}
+	if err := logger.Emit(core.Event{
+		RunID:     runID,
+		Level:     "info",
+		EventType: "run_started",
+		Payload: map[string]string{
+			"repo_path": c.RepoPath,
+		},
+	}); err != nil {
+		return Result{}, err
+	}
 
 	runnerRegistry := runner.NewRegistry(artifactRoot)
 	adapter := repo.NewAdapter()
@@ -117,54 +131,123 @@ func (c Command) Run(ctx context.Context) (Result, error) {
 
 		artifacts, err := plugin.Collect(ctx, runCtx)
 		if err != nil {
-			return finalize(storeDB, runID, summary, err)
+			return finalize(storeDB, logger, runID, summary, err)
+		}
+		if err := logger.Emit(core.Event{
+			RunID:     runID,
+			Level:     "info",
+			EventType: "collect_finished",
+			Tool:      plugin.ID(),
+			Payload: map[string]int{
+				"artifact_count": len(artifacts.Items),
+			},
+		}); err != nil {
+			return Result{}, err
 		}
 
 		for _, artifact := range artifacts.Items {
 			if err := storeDB.AddArtifact(ctx, artifact); err != nil {
-				return finalize(storeDB, runID, summary, err)
+				return finalize(storeDB, logger, runID, summary, err)
 			}
 		}
 
 		findings, err := plugin.Normalize(ctx, runCtx, artifacts)
 		if err != nil {
-			return finalize(storeDB, runID, summary, err)
+			return finalize(storeDB, logger, runID, summary, err)
+		}
+		if err := logger.Emit(core.Event{
+			RunID:     runID,
+			Level:     "info",
+			EventType: "normalize_finished",
+			Tool:      plugin.ID(),
+			Payload: map[string]int{
+				"finding_count": len(findings),
+			},
+		}); err != nil {
+			return Result{}, err
 		}
 
 		if err := storeDB.InsertFindings(ctx, findings); err != nil {
-			return finalize(storeDB, runID, summary, err)
+			return finalize(storeDB, logger, runID, summary, err)
 		}
 
 		tasks, err := plugin.Plan(ctx, runCtx, findings)
 		if err != nil {
-			return finalize(storeDB, runID, summary, err)
+			return finalize(storeDB, logger, runID, summary, err)
+		}
+		if err := logger.Emit(core.Event{
+			RunID:     runID,
+			Level:     "info",
+			EventType: "plan_finished",
+			Tool:      plugin.ID(),
+			Payload: map[string]int{
+				"task_count": len(tasks),
+			},
+		}); err != nil {
+			return Result{}, err
 		}
 
 		for i := range tasks {
 			spec, err := plugin.ValidationSpec(ctx, runCtx, tasks[i])
 			if err != nil {
-				return finalize(storeDB, runID, summary, err)
+				return finalize(storeDB, logger, runID, summary, err)
 			}
 			validationJSON, err := json.Marshal(spec)
 			if err != nil {
-				return finalize(storeDB, runID, summary, err)
+				return finalize(storeDB, logger, runID, summary, err)
 			}
 			tasks[i].ValidationJSON = string(validationJSON)
 		}
 
 		if err := storeDB.InsertTasks(ctx, tasks); err != nil {
-			return finalize(storeDB, runID, summary, err)
+			return finalize(storeDB, logger, runID, summary, err)
 		}
 
 		summary.Add(findings, tasks)
 	}
 
+	agentAdapter := selectAgentAdapter()
+	gitStrategy := selectGitStrategy(cfg.GitStrategy, artifactRoot)
+	executor := engine.Executor{
+		Store:       storeDB,
+		RunContext:  runCtx,
+		Agent:       agentAdapter,
+		GitStrategy: gitStrategy,
+		Plugins:     plugins,
+	}
+	if err := executor.Run(ctx); err != nil {
+		return finalize(storeDB, logger, runID, summary, err)
+	}
+
 	summaryJSON, err := json.Marshal(summary)
 	if err != nil {
-		return finalize(storeDB, runID, summary, err)
+		return finalize(storeDB, logger, runID, summary, err)
 	}
 
 	if err := storeDB.UpdateRunStatus(ctx, runID, core.RunStatusSucceeded, string(summaryJSON)); err != nil {
+		return Result{}, err
+	}
+
+	report, err := buildRunReport(ctx, storeDB, runID, summary)
+	if err != nil {
+		return Result{}, err
+	}
+	reportPath := filepath.Join(artifactRoot, "summary.json")
+	if err := writeJSON(reportPath, report); err != nil {
+		return Result{}, err
+	}
+	if err := storeDB.AddArtifact(ctx, newArtifact(runID, "core", "summary", reportPath)); err != nil {
+		return Result{}, err
+	}
+
+	if err := logger.Emit(core.Event{
+		RunID:     runID,
+		Level:     "info",
+		EventType: "run_finished",
+		Payload: map[string]string{
+			"status": core.RunStatusSucceeded,
+		},
+	}); err != nil {
 		return Result{}, err
 	}
 
@@ -175,7 +258,7 @@ func (c Command) Run(ctx context.Context) (Result, error) {
 	}, nil
 }
 
-func finalize(storeDB *store.SQLiteStore, runID string, summary core.Summary, runErr error) (Result, error) {
+func finalize(storeDB *store.SQLiteStore, logger core.EventLogger, runID string, summary core.Summary, runErr error) (Result, error) {
 	summaryJSON, err := json.Marshal(summary)
 	if err != nil {
 		return Result{}, err
@@ -184,6 +267,91 @@ func finalize(storeDB *store.SQLiteStore, runID string, summary core.Summary, ru
 	if updateErr := storeDB.UpdateRunStatus(context.Background(), runID, core.RunStatusFailed, string(summaryJSON)); updateErr != nil {
 		return Result{}, updateErr
 	}
+	if logger != nil {
+		_ = logger.Emit(core.Event{
+			RunID:     runID,
+			Level:     "error",
+			EventType: "run_failed",
+			Payload: map[string]string{
+				"error": runErr.Error(),
+			},
+		})
+	}
 
 	return Result{}, runErr
+}
+
+type runReport struct {
+	RunID     string       `json:"run_id"`
+	Status    string       `json:"status"`
+	Findings  int          `json:"findings"`
+	Tasks     int          `json:"tasks"`
+	StartedAt string       `json:"started_at"`
+	Finished  string       `json:"finished_at"`
+	Summary   core.Summary `json:"summary"`
+}
+
+func buildRunReport(ctx context.Context, storeDB *store.SQLiteStore, runID string, summary core.Summary) (runReport, error) {
+	runSummary, err := storeDB.GetRunSummary(ctx, runID)
+	if err != nil {
+		return runReport{}, err
+	}
+	finished := ""
+	if !runSummary.Finished.IsZero() {
+		finished = runSummary.Finished.UTC().Format(time.RFC3339)
+	}
+	return runReport{
+		RunID:     runSummary.RunID,
+		Status:    runSummary.Status,
+		Findings:  runSummary.Findings,
+		Tasks:     runSummary.Tasks,
+		StartedAt: runSummary.Started.UTC().Format(time.RFC3339),
+		Finished:  finished,
+		Summary:   summary,
+	}, nil
+}
+
+func writeJSON(path string, payload interface{}) error {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func newArtifact(runID string, tool string, kind string, path string) core.ArtifactRecord {
+	info, _ := os.Stat(path)
+	size := int64(0)
+	if info != nil {
+		size = info.Size()
+	}
+	return core.ArtifactRecord{
+		RunID:     runID,
+		Tool:      tool,
+		Kind:      kind,
+		Path:      path,
+		SizeBytes: size,
+		CreatedAt: time.Now(),
+	}
+}
+
+func selectGitStrategy(strategy string, artifactRoot string) git.Strategy {
+	switch strategy {
+	case "worktree":
+		return git.NewWorktree(filepath.Join(artifactRoot, "worktrees"))
+	default:
+		return git.NewInPlace()
+	}
+}
+
+func selectAgentAdapter() agent.Agent {
+	codexCommand := strings.Fields(os.Getenv("ATQOS_CODEX_CMD"))
+	if len(codexCommand) > 0 {
+		return agent.NewCodexCLI(codexCommand)
+	}
+	command := strings.Fields(os.Getenv("ATQOS_AGENT_CMD"))
+	if len(command) == 0 {
+		return agent.NewLocal()
+	}
+	return agent.NewCommandAdapter("cli", command)
 }

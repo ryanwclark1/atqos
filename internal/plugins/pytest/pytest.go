@@ -238,14 +238,25 @@ func newArtifact(runID string, tool string, kind string, path string) core.Artif
 	if info != nil {
 		size = info.Size()
 	}
+	sum, _ := fileSHA256(path)
 	return core.ArtifactRecord{
 		RunID:     runID,
 		Tool:      tool,
 		Kind:      kind,
 		Path:      path,
+		SHA256:    sum,
 		SizeBytes: size,
 		CreatedAt: time.Now(),
 	}
+}
+
+func fileSHA256(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func hashFinding(nodeID string, outcome string, message string) string {
